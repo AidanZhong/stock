@@ -16,13 +16,15 @@ import time, requests, pandas as pd, numpy as np, json, os, datetime
 import matplotlib
 from matplotlib import pyplot as plt
 
+from notifier import send_telegram_message
+
 matplotlib.use("TkAgg")
 # --- CONFIG ---
 OANDA_URL = "https://api-fxpractice.oanda.com/v3"
 ACCOUNT_ID = "101-004-37405580-001"
 API_KEY = "6cae6190e1ce41e05724528b6dc3179e-ed6d4e7bcaaa1b3f8f8f6cac933b7bc6"
 
-INSTRUMENT = "XAU_USD"  # Gold spot
+INSTRUMENT = "XAG_USD"  # Gold spot
 GRANULARITY = "M1"  # 1-minute candles
 CANDLE_COUNT = 500
 
@@ -102,18 +104,46 @@ def compute_levels(entry, df):
 
 def generate_signals(df):
     last, prev = df.iloc[-1], df.iloc[-2]
+
+    # === LONG SETUPS ===
     in_uptrend = last["close"] > last["ema_trend"]
     crossed_up = prev["rsi"] <= RSI_ENTRY_THRESHOLD and last["rsi"] > RSI_ENTRY_THRESHOLD
     if in_uptrend and crossed_up:
         tp, sl = compute_levels(last["close"], df)
         return {"action": "buy", "price": last["close"], "tp": tp, "sl": sl,
                 "why": f"RSI cross↑{RSI_ENTRY_THRESHOLD} + price above EMA200"}
+
     near_ema = abs(last["close"] - last["ema_fast"]) / last["ema_fast"] < 0.002
     rsi_bounce = prev["rsi"] <= RSI_ADD_THRESHOLD and last["rsi"] > RSI_ADD_THRESHOLD
     if in_uptrend and near_ema and rsi_bounce:
         tp, sl = compute_levels(last["close"], df)
         return {"action": "add", "price": last["close"], "tp": tp, "sl": sl,
                 "why": f"Pullback near EMA20 + RSI bounce↑{RSI_ADD_THRESHOLD}"}
+
+    # === SHORT SETUPS ===
+    in_downtrend = last["close"] < last["ema_trend"]
+    crossed_down = prev["rsi"] >= 70 and last["rsi"] < 70
+    if in_downtrend and crossed_down:
+        # mirror of compute_levels for short
+        recent = df.iloc[-SWING_LOOKBACK:]
+        swing_high = recent["high"].max()
+        atr_val = recent["atr"].iloc[-1]
+        tp = last["close"] - RISK_REWARD * (swing_high - last["close"])
+        sl = min(swing_high, last["close"] + ATR_SL_MULTIPLIER * atr_val)
+        return {"action": "sell", "price": last["close"], "tp": round(tp, 2), "sl": round(sl, 2),
+                "why": f"RSI cross↓70 + price below EMA200"}
+
+    near_ema_short = abs(last["close"] - last["ema_fast"]) / last["ema_fast"] < 0.002
+    rsi_fall = prev["rsi"] >= 60 and last["rsi"] < 60
+    if in_downtrend and near_ema_short and rsi_fall:
+        recent = df.iloc[-SWING_LOOKBACK:]
+        swing_high = recent["high"].max()
+        atr_val = recent["atr"].iloc[-1]
+        tp = last["close"] - RISK_REWARD * (swing_high - last["close"])
+        sl = min(swing_high, last["close"] + ATR_SL_MULTIPLIER * atr_val)
+        return {"action": "add_short", "price": last["close"], "tp": round(tp, 2), "sl": round(sl, 2),
+                "why": f"Pullback near EMA20 + RSI cross↓60"}
+
     return {"action": None}
 
 
@@ -207,13 +237,6 @@ def run_loop():
     plt.ion()
     fig, (ax_price, ax_rsi, ax_atr) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     fig.suptitle(f"{INSTRUMENT} — Live RSI + Pullback Strategy", fontsize=14)
-
-    # keep window on top
-    try:
-        fig.canvas.manager.window.attributes('-topmost', True)
-    except Exception:
-        pass
-
     while True:
         try:
             df = add_indicators(fetch_oanda_candles())
@@ -233,8 +256,8 @@ def run_loop():
                 state["last_signal_ts"] = ts
                 state["position"] = sig
                 save_state(state)
-                print(f"🚀 SIGNAL: {sig['action'].upper()} at {sig['price']:.2f} | TP {sig['tp']} | SL {sig['sl']}")
-                print(f"    Reason: {sig['why']}")
+                message = f"🚀 SIGNAL: {sig['action'].upper()} at {sig['price']:.2f} | TP {sig['tp']} | SL {sig['sl']} \n Reason: {sig['why']}"
+                print(message)
                 # store for chart
                 entries.append({
                     "time": latest_time,
@@ -243,51 +266,9 @@ def run_loop():
                     "sl": sig["sl"],
                     "type": sig["action"]
                 })
+                send_telegram_message(message)
             else:
                 print("No new signal.")
-
-            # -------------- PLOTTING --------------
-            ax_price.clear();
-            ax_rsi.clear();
-            ax_atr.clear()
-
-            # price + EMA
-            ax_price.plot(df.index, df["close"], color="black", label="Close")
-            ax_price.plot(df.index, df["ema_fast"], color="blue", label="EMA20")
-            ax_price.plot(df.index, df["ema_trend"], color="orange", label="EMA200")
-            ax_price.grid(True)
-            ax_price.legend(loc="upper left")
-
-            # latest price text
-            latest_time_str = latest_time.strftime("%Y-%m-%d %H:%M:%S")
-            text_str = f"Latest: {latest['close']:.2f} USD ({latest_time_str} UTC)"
-            ax_price.text(0.01, 0.95, text_str, transform=ax_price.transAxes,
-                          fontsize=9, color="green",
-                          bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"))
-
-            # 🎯 draw entries + TP/SL
-            for e in entries:
-                color = "green" if e["type"] == "buy" else "cyan"
-                ax_price.scatter(e["time"], e["price"], color=color, marker="^", s=80, zorder=5)
-                ax_price.axhline(e["tp"], color="lime", linestyle="--", linewidth=1, alpha=0.8)
-                ax_price.axhline(e["sl"], color="red", linestyle="--", linewidth=1, alpha=0.8)
-                ax_price.text(df.index[-1], e["tp"], f"TP {e['tp']}", color="lime", fontsize=8, va="bottom")
-                ax_price.text(df.index[-1], e["sl"], f"SL {e['sl']}", color="red", fontsize=8, va="top")
-
-            # RSI panel
-            ax_rsi.plot(df.index, df["rsi"], color="purple")
-            ax_rsi.axhline(70, color="red", linestyle="--")
-            ax_rsi.axhline(30, color="green", linestyle="--")
-            ax_rsi.set_ylim(0, 100)
-            ax_rsi.grid(True)
-
-            # ATR panel
-            ax_atr.plot(df.index, df["atr"], color="brown")
-            ax_atr.grid(True)
-
-            # refresh chart
-            fig.canvas.draw()
-            fig.canvas.flush_events()
 
         except Exception as e:
             print("❌ Error:", e)
